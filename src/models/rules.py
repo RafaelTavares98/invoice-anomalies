@@ -3,10 +3,18 @@
 Each rule is a red flag a clerk already looks for. The score is the
 weighted share of flags raised. Every model in this project must beat it
 on the same weeks; a model that cannot is not worth its upkeep.
+
+The static weights below are the desk's own guess. `learn_weights`
+replaces the guess with what the training weeks measure: a rule earns
+its weight by how much it raises the odds of a real error, not by how
+sad a miss would be. A rare rule that is always right outranks a common
+one that is almost always wrong.
 """
 
 import numpy as np
 import pandas as pd
+
+from evaluation import splits
 
 #: Flag name, test, weight. Heavier weights are the costlier misses.
 RULES = (
@@ -35,8 +43,46 @@ def flags(table):
                          for name, test, _ in RULES}, index=table.index)
 
 
-def score(table):
+def learn_weights(table, cutoff):
+    """Each rule's weight, from how much it raises the odds.
+
+    The odds come from the rows passed in, and the rows must all be
+    dated on or before the cutoff: a week the desk has not decided yet
+    teaches nothing. The label column wins when the caller already
+    computed it; otherwise the labels are the ones known by the cutoff.
+    A rule that never fires has nothing to say and weighs nothing.
+    """
+    cutoff = pd.Timestamp(cutoff)
+    dates = pd.to_datetime(table['issue_date'])
+    if len(dates) and dates.max() > cutoff:
+        raise ValueError(f'a row after the cutoff {cutoff.date()} was passed in')
+    if 'label' in table:
+        labels = table['label'].astype(int)
+    else:
+        labels = splits.known_labels(table, cutoff).astype(int)
+    base = float(labels.mean()) if len(labels) else 0.0
+    weights = {}
+    for name, test, _ in RULES:
+        fired = test(table).astype(bool)
+        fires = int(fired.sum())
+        if not fires or base <= 0:
+            weights[name] = 0.0
+            continue
+        hits = int(labels[fired].sum())
+        precision = (hits + 1) / (fires + 2)
+        weights[name] = precision / base
+    return weights
+
+
+def score(table, weights=None):
     """The weighted share of rules that fire, from 0 to 1."""
     raised = flags(table)
-    weights = np.array([weight for _, _, weight in RULES])
-    return pd.Series(raised.values @ weights / TOTAL, index=table.index)
+    if weights is None:
+        values = np.array([weight for _, _, weight in RULES], dtype=float)
+    else:
+        values = np.array([weights[name] for name, _, _ in RULES],
+                          dtype=float)
+    total = values.sum()
+    if total <= 0:
+        return pd.Series(0.0, index=table.index)
+    return pd.Series(raised.values @ values / total, index=table.index)

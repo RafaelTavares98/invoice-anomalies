@@ -19,6 +19,19 @@ FLOOR = 0.60
 #: three-in-five is a real fall, not a quiet fortnight.
 RUN = 3
 
+
+def floor_from(weekly_table, quantile=0.10):
+    """The tenth percentile of the finished weeks' precision.
+
+    The floor is measured, not guessed: it is where a healthy champion's
+    worst tenth of weeks sits. A week with nothing decided is not
+    finished and teaches nothing.
+    """
+    finished = weekly_table['precision'].dropna()
+    if not len(finished):
+        return None
+    return float(finished.quantile(quantile))
+
 #: The verdicts that close a case.
 DECIDED = ('confirmed', 'dismissed')
 

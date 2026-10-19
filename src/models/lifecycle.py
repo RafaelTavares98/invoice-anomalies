@@ -68,6 +68,27 @@ def challenge(model, held_out):
     return train.report(held_out, scores)
 
 
+def register(model_uri, tracking_uri=None, score=None, features=None):
+    """Register a model and make it champion, on the loop's verdict.
+
+    A challenger that wins its weeks since training has already earned
+    the alias; the held-out score is only the number reported beside it.
+    """
+    import mlflow
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+    client = mlflow.MlflowClient()
+    version = mlflow.register_model(model_uri, NAME)
+    if score is not None:
+        client.set_model_version_tag(NAME, version.version,
+                                     'average_precision', str(score))
+    if features:
+        client.set_model_version_tag(NAME, version.version, 'features',
+                                     ','.join(features))
+    client.set_registered_model_alias(NAME, 'champion', version.version)
+    return version.version
+
+
 def register_if_better(model_uri, score, tracking_uri=None, metric='average_precision',
                        features=None):
     """Register the model; make it champion if it beats the current one."""

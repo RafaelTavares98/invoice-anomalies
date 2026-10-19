@@ -1,327 +1,194 @@
 ---
 type: Runbook
 title: Closing the triage loop
-description: Every step left in project 02, test first, for someone who has never seen this code.
+description: Steps 1 to 9 are done. Three faults remain, each with its test. Rewritten 2026-10-19.
 status: stable
 ---
 
 # Closing the triage loop
 
-You are finishing project 02. Read this whole page before you touch a
-file. Do the steps in order. Do not skip a step because it looks easy.
+The first nine steps are done and published. This page is now the
+second pass: three faults, found by review, each with the test that
+proves it fixed.
 
-## What this project is
-
-Project 01 invents an importer's invoices, mails them, reads them back
-from PDF and writes an answer key. Project 02 reads that output and
-scores every invoice for how likely it is to be an error. The point of
-the work left is not a better score. It is a **loop**: the model flags,
-an analyst decides, the decision becomes a new label, the model is
-retrained, and a better model takes over. Grafana shows all of it.
+Read this whole page before touching a file.
 
 ## Rules you must follow
 
-1. **Test first, always.** Write the test. Run it. See it fail for the
-   right reason. Then write the code. Then run the whole suite.
-2. **Never change a test to make it pass.** If a test is wrong, say so
-   and stop.
-3. **No chart files, ever.** Every chart of projects 01 and 02 is drawn
-   in Grafana, from Prometheus gauges. You write gauges, not pictures.
-4. **Nothing reads the future.** A feature or a label computed at week 9
-   may use week 8 and earlier only.
-5. **Seed 5 is sacred.** `year-seed5` is the held-out year. Nothing is
-   tuned, chosen or inspected on it. You may score it once per step.
-6. **Run the whole suite between steps**, not just the new test.
-7. **Nothing you run may take longer than ten minutes.** If it does,
-   stop it, write down how long it was going to take, and carry on.
-8. Comments explain **why**, never what. Match the voice of the files
-   around you: plain words, short sentences.
+1. **Test first, always.** The test comes from Claude, already written
+   and already failing. You make it pass. You do not write it.
+2. **Never change a test.** If a test looks wrong, stop and say so.
+3. **Never touch anything on the protected list below.**
+4. **No chart files.** Charts live in Grafana, drawn from Prometheus
+   gauges.
+5. **Nothing reads the future.** A feature or label at week 9 may use
+   week 8 and earlier only.
+6. **Seed 5 is sacred.** `year-seed5` is scored, never tuned on.
+7. **Run the whole suite between steps.** Not just the new test.
+8. **Nothing runs longer than ten minutes.** If it would, stop it, write
+   down the cost, and carry on.
+9. Comments say **why**, never what. Short sentences, plain words.
 
-## Where things are
+## Protected: working code, do not rewrite
 
-```text
-02-invoice-anomalies/
-├── run.py                      features, walk, compare, score, metrics, ui
-├── mlflow.db                   the local MLflow store (SQLite)
-├── data/features/*.csv         cached feature tables, safe to delete
-└── src/
-    ├── data/load.py            reads one dataset from project 01
-    ├── features/build.py       COLUMNS: the feature names, in order
-    ├── evaluation/
-    │   ├── metrics.py          precision_at_k, recall_at, recall_by_kind,
-    │   │                       twin_alarms, average_precision; K = 5
-    │   ├── reading.py          perfect data against what the reader got
-    │   └── splits.py           week_of, known_labels, prequential
-    └── models/
-        ├── rules.py            RULES: (name, test, weight)
-        ├── train.py            MODELS, report, compare, table_for
-        ├── lifecycle.py        walk_forward, register_if_better
-        ├── scoring.py          rows(): the dashboard table
-        └── exporter.py         publish(): the Prometheus gauges
-```
+These are correct. Change them only where a step below names the
+function by name, and change nothing else in the file.
 
-Tests mirror `src/` under `tests/`.
+| File | Why it is protected |
+|---|---|
+| `src/data/load.py` | the number-matched join; it was broken once already |
+| `src/features/build.py` | 24 features, none reading the future |
+| `src/evaluation/splits.py` | the walk-forward split and the late labels |
+| `src/evaluation/metrics.py` | every published number comes from here |
+| `src/models/train.py` | the four models and the MLflow comparison |
+| `src/models/feedback.py` | the verdict becomes a label |
+| `src/models/exporter.py` | the eight gauges Grafana reads |
+| `src/runs/loop.py` | the week-by-week walk, including the maturing decisions |
+| every file under `tests/` | written by Claude, not yours to edit |
+| `monitoring/grafana/dashboards/pipeline.json` | ten panels, the grid is right |
 
-## First, make it run
+If a fix seems to need one of these changed, that is a finding. Write
+it down and stop.
 
-```bash
-cd ../01-invoice-pipeline
-python run.py dataset year 1 2 3 4 5
-python run.py dataset drift 7
-cd ../02-invoice-anomalies
-python -m pip install -r requirements.txt
-python -m pytest -q
-```
+## The state of the thing
 
-The suite must be green before you start. If it is not, fix that first
-and nothing else.
+- 105 tests pass. The loop runs end to end on `drift-seed7`.
+- LightGBM is `invoice-anomaly@champion`, 0.86 average precision on the
+  held-out year.
+- Grafana is alive: ten panels, the four model gauges among them.
+- Three faults remain. They are below, worst first.
 
 ---
 
-# Step 1. Put the customs errors on the scoreboard
+# Fault 1. The rules baseline collapsed
 
-**Why.** Project 01 now plants two more kinds, `duty_rate_wrong` and
-`broker_fee_over`. The numbers printed in `README.md` were measured
-before they existed, so they are wrong today.
+**What is wrong.** The README now shows the desk's rules at 0.20
+average precision, below Isolation Forest. That breaks the project's
+argument: the rules are the floor a model has to clear.
 
-**Test first.** `tests/evaluation/test_metrics.py`, a new test:
+**Why it happens.** `rules.score` is a weighted share of the rules that
+fire, and the weights were set by how costly a miss is, not by how
+often the rule is right. Measured on `year-seed1`, 5330 invoices:
 
-- Build a small frame with `week`, `score`, `is_anomaly`, `anomaly`,
-  `lookalike_of`, holding one `duty_rate_wrong`, one `broker_fee_over`
-  and one `fee_amended` twin.
-- Assert `recall_by_kind` returns a key for each of the two kinds.
-- Assert `twin_alarms` returns a key for `fee_amended`.
-
-**Then.** Delete `data/features/*.csv` so the features are built again.
-Run:
-
-```bash
-python run.py features
-python run.py walk
-python run.py compare
-```
-
-**Done when.** `compare` prints four models, and the MLflow run holds a
-`recall_duty_rate_wrong` and a `recall_broker_fee_over` metric. Write
-the new table into `README.md`, replacing the one dated 2026-10-12.
-Keep the date line honest: change it to the day you ran it.
-
----
-
-# Step 2. Prove the score is real
-
-**Why.** A number nobody can break is not evidence. Two tests break it
-on purpose.
-
-**Test first.** New file `tests/models/test_honesty.py`:
-
-1. **The leak test.** Copy a feature table, add a column that is the
-   label itself, train LightGBM on it, score the held-out weeks.
-   Assert average precision is above 0.99. A model that cannot cheat
-   when handed the answer is not learning at all.
-2. **The shuffle test.** Shuffle `is_anomaly` within the table, train,
-   score. Assert average precision lands near the base rate, under
-   0.15. A model that still scores well on nonsense is reading
-   something it should not.
-
-Use a small table: one seed, the first twelve weeks. Both tests must
-run in under a minute each.
-
-**Done when.** Both pass, and the suite is green.
-
----
-
-# Step 3. The analyst's verdict becomes a label
-
-**Why.** Today `scoring.rows()` invents the analyst's decision from the
-answer key, for display. Nothing feeds it back. That feedback is the
-whole project.
-
-**New file** `src/models/feedback.py`.
-
-**Test first.** New file `tests/models/test_feedback.py`:
-
-1. `labels_from(decisions, as_of)` takes the scored table and a date.
-   - A row decided `confirmed` on or before `as_of` becomes label 1.
-   - A row decided `dismissed` on or before `as_of` becomes label 0.
-   - A row still `pending` is **dropped**, not labelled 0.
-   - A row never flagged is label 0: nobody looked, and it is the
-     normal case.
-2. `labels_from` must refuse a decision dated after `as_of`. Assert it
-   raises, with a message naming the row.
-3. A table with no decisions at all returns the labels
-   `splits.known_labels` would give. The loop must degrade to today's
-   behaviour, not break.
-
-**Then** write the module. Keep it pure: a frame in, a frame out, no
-files, no MLflow.
-
-**Done when.** The three tests pass and `splits.known_labels` is still
-used by `train.with_known_labels`. Do not rewrite that path yet.
-
----
-
-# Step 4. Watch the precision week by week
-
-**Why.** You cannot retrain on a feeling. You need a number per week
-that says the model is slipping.
-
-**New file** `src/evaluation/watch.py`.
-
-**Test first.** New file `tests/evaluation/test_watch.py`:
-
-1. `weekly(scored)` returns one row per week: the week, the number
-   flagged, the number confirmed, and `precision` as confirmed divided
-   by the decided flags. Pending rows count in neither.
-2. A week where every flag is still pending has `precision` as null,
-   not zero. Assert it, and assert the row is still present.
-3. `slipping(weekly, floor, run)` returns True only when `run`
-   consecutive finished weeks sit below `floor`. One bad week is noise.
-   Test: floor 0.5, run 3, a series of 0.8, 0.4, 0.9, 0.3, 0.3, 0.3
-   returns True; the same series without the last 0.3 returns False.
-
-Use `floor = 0.60` and `run = 3` as the module defaults, and say in the
-docstring why: the desk checks five a week, so three straight weeks
-below three-in-five is a real fall, not a quiet fortnight.
-
----
-
-# Step 5. Notice the world changing
-
-**Why.** Precision falls after the damage. Drift in the features shows
-up first.
-
-**Add to** `src/evaluation/watch.py`.
-
-**Test first**, in `tests/evaluation/test_watch.py`:
-
-1. `drift(reference, recent)` returns one number per feature in
-   `features.build.COLUMNS`: the population stability index between the
-   two frames.
-2. Identical frames give 0 for every feature. Assert it exactly, to
-   four decimal places.
-3. A feature shifted hard gives above 0.25, the usual line for "this
-   has moved". Build the shifted frame in the test; do not read a file.
-4. `drifted(scores, line=0.25)` returns the names over the line, in
-   order, worst first.
-
-**Done when.** The four tests pass, and nothing in `watch.py` imports
-MLflow or writes a file.
-
----
-
-# Step 6. Retrain, and only promote a winner
-
-**Why.** This is the step a client cares about. A model that is replaced
-on evidence is worth more than a model with a better score.
-
-**Add to** `src/models/lifecycle.py`.
-
-**Test first.** New file `tests/models/test_retraining.py`:
-
-1. `retrain(table, as_of, feedback)` trains LightGBM on the weeks up to
-   `as_of`, using the labels from step 3, and returns the fitted model
-   and the rows it saw. Assert it never saw a row after `as_of`.
-2. `challenge(model, held_out)` scores the held-out year and returns the
-   same dictionary `train.report` returns. Assert the keys match
-   `train.report` exactly, so the two can be compared.
-3. `register_if_better` already exists and already refuses a model that
-   does not beat the champion. Add one test: a challenger that scores
-   **equal** to the champion stays challenger. A tie is not a win.
-
-**Then.** Add a command to `run.py`:
-
-```bash
-python run.py retrain [DATASET]
-```
-
-It must print, in plain words, four lines: the weeks it trained on, the
-champion's score, the challenger's score, and which one serves now.
-
-**Done when.** Running it twice in a row promotes nothing the second
-time, and says so.
-
----
-
-# Step 7. The whole story, on one command
-
-**Why.** A demo nobody can run is not a demo.
-
-**Add to** `run.py` a command `loop`, over the drift dataset
-(`drift-seed7`, 26 weeks, where the anomaly rates double at week 13).
-
-For each week in order:
-
-1. Score the week with the current champion.
-2. Build the analyst's decisions, as of that week's end.
-3. Turn the decisions into labels (step 3).
-4. Append the week to the weekly watch (step 4) and the drift
-   measure (step 5).
-5. If `slipping` or `drifted` fires, retrain and challenge (step 6).
-6. Write the whole state out, every week, as the scored CSV the
-   exporter reads.
-
-**Test first.** New file `tests/runs/test_loop.py`, on a cut-down table
-of eight weeks:
-
-1. The loop visits every week once, in order.
-2. No retraining happens before the floor is breached.
-3. After a week where the labels are made deliberately bad, a
-   retraining is recorded.
-4. The run is reproducible: the same seed twice gives the same
-   sequence of events.
-
-**Ten-minute rule.** If 26 weeks takes longer than ten minutes, cut the
-loop to the first 16 and write down what the full run would cost.
-
----
-
-# Step 8. Put it on the screen
-
-**Why.** Everything above is invisible until Grafana draws it.
-
-**Add to** `src/models/exporter.py`, test first in
-`tests/models/test_exporter.py`. Four new gauges:
-
-| Gauge | Labels | Holds |
+| Rule | Fires on | Of those, real |
 |---|---|---|
-| `anomaly_weekly_precision` | none | the last finished week's precision |
-| `anomaly_feature_drift` | `feature` | the stability index, per feature |
-| `anomaly_retrainings` | none | how many retrainings have happened |
-| `anomaly_champion_version` | none | the registry version serving now |
+| account not on file | 0.2% | 100% |
+| sender not on file | 0.2% | 100% |
+| price above contract | 0.8% | 100% |
+| quantity above receipt | 0.3% | 100% |
+| duty at a rate not in force | 0.1% | 100% |
+| broker fee above contract | 0.2% | 100% |
+| round total, not a known fee | 0.3% | 65% |
+| young vendor | 0.2% | 75% |
+| charge not on the rate card | 2.5% | 23% |
+| same amount again | 3.8% | 17% |
+| **order split under the limit** | **8.1%** | **6.5%** |
+| **no order behind a goods bill** | **12.7%** | **1.9%** |
 
-Keep the four that exist. Each new gauge needs a test that publishes a
-small frame and reads the value back out of the registry.
+The last two fire on a fifth of every invoice and are almost always
+wrong. Each carries weight 2, the same as "account not on file", which
+is never wrong. So about a thousand invoices a year tie at the same
+score as the handful that are certain, and the weekly top five is
+filled by whichever row sorted first. That is the collapse.
 
-**Then** add one Grafana panel per gauge to project 01's dashboard file,
-`01-invoice-pipeline/monitoring/grafana/dashboards/pipeline.json`, in a
-seventh block titled `7. The model on duty`. Match the style of the six
-blocks already there: same colours, same legend placement, no new
-colours. The dashboard is the home dashboard, served from the file, so
-reload `http://localhost:3000` and look at it before you say it works.
+**The fix.** Weight a rule by how much it raises the odds, not by how
+sad the miss would be. Rule weights must be learnt from the training
+weeks only, never from the test year, and never from a week the desk
+has not decided yet.
 
-**Done when.** You have looked at the panels with your own eyes, with
-the loop running, and the retraining count went up on screen.
+**Tests, already written** (`tests/models/test_rule_weights.py`):
+
+1. A rule that fires on 1% of rows and is right every time outranks a
+   rule that fires on 20% and is right 2% of the time.
+2. Weights are fitted on the training rows passed in, and the function
+   raises if asked to fit on rows after the cutoff.
+3. The twelve rule names and their order are unchanged. `scoring.STAGE`
+   must keep matching them.
+4. On a table where every rule is equally right, the score matches
+   today's equal-weight score, to four decimal places.
+
+**Done when.** `python run.py compare` puts the rules above both
+unsupervised models on average precision, and the README table is
+rewritten with the new numbers and the date you ran them.
 
 ---
 
-# Step 9. Write it down and publish
+# Fault 2. The loop retrains forever and promotes nothing
 
-1. Rewrite `README.md` around the loop, not the score table. Order:
-   what the desk's day looks like, the loop, the numbers, how to run it.
-   The numbers stay, but they stop being the headline.
-2. Take one screenshot of the Grafana block from step 8 into
-   `docs/monitoring.png`. No other image.
-3. Add `docs/reading-order.md`, the same shape as project 01's.
-4. Publish the repository as `invoice-anomalies`. `git` is not on the
-   PATH on this machine; the GitHub CLI is installed and signed in, so
-   create and push with `gh`.
-5. Add an entry to the wiki `log.md` saying what was built and when.
+**What is wrong.** On `drift-seed7` the weekly precision sits under the
+0.60 floor almost every week. The loop retrains 25 times in 26 weeks
+and no challenger ever beats the 0.86 champion, so the dashboard shows
+a flat line and a counter going up. The mechanics are right; nothing
+tells a story.
 
-## Done, for the whole project
+**Why it happens.** Three things at once.
 
-- The suite is green and every step above has its tests.
-- `python run.py loop` runs end to end and ends with a promotion.
-- Grafana shows the fall, the retraining and the recovery.
-- The README leads with the loop.
-- The repository is public.
+1. The floor is a guess. Nothing measured it.
+2. The champion was trained on four full years. A challenger trained on
+   a handful of weeks cannot beat it on the held-out year, ever.
+3. A retraining fires on drift **or** a slip, and drift fires almost
+   every week, because the comparison is one week against the previous
+   week and a week is small.
+
+**The fix, in this order.**
+
+- The floor comes from the training years: the tenth percentile of the
+  weekly precision a healthy champion reaches. Not a guess.
+- A challenger is judged on **the weeks since it was trained**, not on
+  the held-out year. The held-out year stays the one-off final number,
+  reported once, as it is today.
+- Drift fires on a week against the **eight weeks before it**, so a
+  small week cannot ring the bell alone.
+
+**Tests, already written** (`tests/evaluation/test_floor.py`,
+`tests/runs/test_loop_story.py`):
+
+1. `watch.floor_from(weekly)` returns the tenth percentile of the
+   finished weeks, and ignores weeks with nothing decided.
+2. Drift against an eight-week window does not fire on a healthy
+   stretch, and does fire when the rates double halfway through.
+3. Over the drift dataset the loop retrains **between one and four
+   times**, not every week.
+4. At least one of those retrainings is promoted.
+5. The promoted model's week-since-training precision is higher than
+   the model it replaced, on the same weeks.
+
+**Done when.** `python run.py loop` prints a fall, a retraining, a
+promotion and a recovery, in that order, and the Grafana panel
+`7. The model on duty: weekly precision` shows the same shape.
+
+---
+
+# Fault 3. The README still sells the score
+
+**What is wrong.** The README leads with a table of four models. The
+project's point is the loop.
+
+**The fix.** Rewrite the README in this order, keeping every number:
+
+1. The desk's day: 5,300 invoices a year, about 190 wrong, two people.
+2. The loop, in six lines: flag, decide, label, watch, retrain, promote.
+3. One screenshot, `docs/monitoring.png`, of block 7.
+4. The numbers, including the new rules baseline.
+5. How to run it.
+
+**Test** (`tests/test_readme.py`): the README names every command in
+`run.py --help` and every number it prints matches the latest MLflow
+run. No test may be written by you.
+
+**Done when.** The README leads with the loop, the repository is
+pushed, and `log.md` has an entry.
+
+---
+
+## Order of work
+
+Fault 1, then 2, then 3. Fault 2's numbers change once Fault 1 lands,
+so do not measure the floor before the weights are fixed.
+
+## When you are stuck
+
+Stop and write what you tried. Do not edit a test, do not weaken a
+threshold to make a check pass, and do not touch the protected list.
+A step that cannot be done as written is a fault in the step, and the
+step gets rewritten, not the code.

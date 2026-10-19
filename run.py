@@ -3,8 +3,12 @@
     python run.py features        build and cache the feature tables
     python run.py walk            week by week over seeds 1 to 4
     python run.py compare         train on seeds 1 to 4, test on seed 5,
-                                  every model recorded in MLflow; LightGBM
-                                  becomes champion only if it beats the last
+                                  every model recorded in MLflow
+    python run.py retrain [DATASET]
+                                  retrain on the analyst's verdicts, then
+                                  challenge the champion on the held-out year
+    python run.py loop [DATASET]  the whole story: score, decide, watch,
+                                  retrain, promote; drift-seed7 by default
     python run.py score [DATASET] [FILE]
                                   the champion scores one dataset for the
                                   dashboard (busy-seed2026, into project 03)
@@ -162,12 +166,9 @@ def retrain(name='drift-seed7'):
 
 
 def loop(name='drift-seed7', out=DASHBOARD_FILE):
-    """The whole story on one command: score, decide, watch, retrain.
-
-    Over the drift dataset, week by week: the serving model scores, the
-    analyst decides, the decisions become labels, the precision and the
-    drift are watched, and a fall retrains and challenges the champion.
-    Every week's scored rows are written to the dashboard file."""
+    """The whole story on one command: score, decide, watch, retrain,
+    promote. Prints the fall, the retrainings, the promotion and the
+    recovery; writes the scored rows the exporter reads."""
     import mlflow
     from mlflow.models import infer_signature
     from runs import loop as loop_mod
@@ -177,8 +178,10 @@ def loop(name='drift-seed7', out=DASHBOARD_FILE):
     built = built.assign(week=splits.week_of(built))
     held = table(HELD_OUT)
     champion = mlflow.lightgbm.load_model(f'models:/{lifecycle.NAME}@champion')
+    floor = loop_mod.training_floor(champion)
 
-    def promote(model, report):
+    def promote(model, verdict):
+        report = lifecycle.challenge(model, held)
         with mlflow.start_run(run_name='loop-retrain'):
             mlflow.log_metrics(report)
             sample = train._matrix(built).head(5)
@@ -187,13 +190,15 @@ def loop(name='drift-seed7', out=DASHBOARD_FILE):
                 signature=infer_signature(sample,
                                           model.predict_proba(sample)[:, 1]),
                 input_example=sample)
-            return lifecycle.register_if_better(
+            lifecycle.register(
                 f'runs:/{mlflow.active_run().info.run_id}/model',
-                round(report['average_precision'], 4), tracking_uri=TRACKING,
+                tracking_uri=TRACKING,
+                score=round(report['average_precision'], 4),
                 features=train.COLUMNS)
+        return True
 
     events, weekly, drifts, scored = loop_mod.run(
-        built, data, held, champion, promote)
+        built, data, held, champion, promote, floor=floor)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     scored.to_csv(out, index=False)
     retrainings = sum(1 for event in events if event['retrained'])
@@ -207,13 +212,26 @@ def loop(name='drift-seed7', out=DASHBOARD_FILE):
         'retrainings': retrainings,
         'champion_version': str(serving.version),
     }, indent=2), encoding='utf-8')
-    print(f'{len(events)} weeks, {retrainings} retraining(s), '
-          f'{int(scored["flagged"].sum())} flags, into {out}')
+    print(f'{len(events)} weeks, floor {floor:.2f}, '
+          f'{retrainings} retraining(s), into {out}')
+    series = ' '.join(f'{event["top_precision"]:.1f}' for event in events)
+    print(f'top-5 precision, week by week: {series}')
     for event in events:
         if event['retrained']:
-            print(f'  week {event["week"]}: precision {event["precision"]:.2f}, '
-                  f'drift [{event["drifted"]}], retrained, '
-                  f'{"promoted" if event["promoted"] else "stays challenger"}')
+            print(f'  week {event["week"]}: retrained, drift '
+                  f'[{event["drifted"]}]')
+        if event['promoted']:
+            print(f'  week {event["week"]}: promoted on the weeks since '
+                  f'training, {event["challenger_precision"]:.2f} against '
+                  f'{event["verdict_served"]:.2f}')
+    promoted = [i for i, event in enumerate(events) if event['promoted']]
+    if promoted:
+        cut = promoted[0]
+        before = sum(e['top_precision'] for e in events[:cut]) / max(1, cut)
+        after = sum(e['top_precision'] for e in events[cut:]) / max(
+            1, len(events) - cut)
+        print(f'recovery: top-5 precision {before:.2f} before the '
+              f'promotion, {after:.2f} after')
 
 
 def metrics(port=None):
@@ -262,6 +280,9 @@ def metrics(port=None):
 
 
 def main():
+    if '--help' in sys.argv[1:]:
+        print(__doc__)
+        return
     mode = sys.argv[1] if len(sys.argv) > 1 else 'compare'
     if mode == 'features':
         for name in (*TRAIN_SEEDS, HELD_OUT):

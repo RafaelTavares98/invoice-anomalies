@@ -35,7 +35,8 @@ class Rules:
     params = {}
 
     def fit_score(self, train, test):
-        return rules.score(test).to_numpy()
+        weights = rules.learn_weights(train, train['issue_date'].max())
+        return rules.score(test, weights).to_numpy()
 
 
 class _PyOD:

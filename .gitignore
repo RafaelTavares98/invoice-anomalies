@@ -1,0 +1,9 @@
+# Rebuilt by `python run.py features` and `compare`.
+data/
+mlflow.db
+mlruns/
+mlartifacts/
+
+__pycache__/
+.pytest_cache/
+.venv/

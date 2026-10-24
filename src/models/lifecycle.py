@@ -13,9 +13,10 @@ not a win. The service always loads
 `models:/invoice-anomaly@champion`.
 """
 
+import numpy as np
 import pandas as pd
 
-from evaluation import splits
+from evaluation import metrics, splits
 from models import train
 
 NAME = 'invoice-anomaly'
@@ -41,31 +42,62 @@ def walk_forward(table, model_name, first_week=8, step=4, k=5):
     return folds
 
 
-def retrain(table, as_of, feedback, seed=0):
-    """A new LightGBM trained on the analyst's labels, up to `as_of`.
+def retrain(table, as_of, feedback, seed=0, features=None):
+    """A new LightGBM on the analyst's labels, up to `as_of`.
 
     `feedback` is the label Series from `models.feedback.labels_from`,
     aligned on the table's index. Rows whose verdict is still pending
-    carry no label and are left out. Returns the fitted model and the
-    rows it saw, nothing more. Labels of one class carry nothing to
-    learn, so they are refused.
+    carry no label and are left out. Only the named features are fitted:
+    35 errors buy about three, and a silent default is how twenty-four
+    crept back in. Returns the fitted model and the rows it saw.
     """
+    if features is None:
+        raise ValueError('name the features to fit; there is no default')
     from lightgbm import LGBMClassifier
     seen = table[table['issue_date'] <= pd.Timestamp(as_of)]
     labels = feedback.reindex(seen.index).dropna().astype(int)
     if labels.nunique() < 2:
         raise ValueError('the labels hold one class; nothing to learn')
     rows = seen.loc[labels.index]
+    columns = list(features)
     params = dict(train.Boosting.params, random_state=seed)
     model = LGBMClassifier(**params)
-    model.fit(train._matrix(rows), labels.to_numpy())
+    model.fit(rows[columns].fillna(0), labels.to_numpy())
     return model, rows
 
 
-def challenge(model, held_out):
-    """The held-out year, scored and reported as `train.report` would."""
-    scores = model.predict_proba(train._matrix(held_out))[:, 1]
-    return train.report(held_out, scores)
+def features_of(model):
+    """The columns the model was fitted on."""
+    names = getattr(model, 'feature_name_', None)
+    if names is None:
+        raise ValueError('the model does not name its features')
+    return list(names)
+
+
+def challenge(model, held_out, features=None):
+    """Score a model on the features it was fitted on.
+
+    With no list, the caller gets the week-by-week report it always got.
+    With one, the list must be the model's own, and the answer carries
+    the ordinary measures beside it: precision, recall and F1 over the
+    week's top k, and the average precision of the ranking.
+    """
+    if features is None:
+        scores = model.predict_proba(train._matrix(held_out))[:, 1]
+        return train.report(held_out, scores)
+    columns = list(features)
+    if columns != features_of(model):
+        raise ValueError('the features differ from the model\'s own')
+    scores = model.predict_proba(held_out[columns].fillna(0))[:, 1]
+    scored = held_out.assign(score=scores, week=splits.week_of(held_out))
+    top = metrics._top(scored, metrics.K).index
+    called = np.asarray(scored.index.isin(top), dtype=int)
+    truth = scored['is_anomaly'].to_numpy(dtype=int)
+    return {'precision': metrics.precision(truth, called),
+            'recall': metrics.recall(truth, called),
+            'f1': metrics.f1(truth, called),
+            'average_precision': metrics.pr_curve(truth,
+                                                  scores)['average_precision']}
 
 
 def register(model_uri, tracking_uri=None, score=None, features=None):

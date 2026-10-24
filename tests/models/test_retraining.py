@@ -28,7 +28,10 @@ def test_retrain_never_sees_a_row_after_the_cutoff(business):
     as_of = pd.Timestamp('2026-02-15')
     labels = pd.Series(business['is_anomaly'].to_numpy(), index=business.index)
 
-    model, rows = lifecycle.retrain(business, as_of, labels)
+    # The features are named because `retrain` has no default any more:
+    # a silent one is how all 24 crept back into a retraining once.
+    model, rows = lifecycle.retrain(business, as_of, labels,
+                                    features=['bank_not_on_file'])
 
     assert rows['issue_date'].max() <= as_of
     assert model is not None

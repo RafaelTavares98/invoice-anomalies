@@ -1,48 +1,87 @@
-"""The loop: score, decide, watch, retrain, promote, one week at a time.
+"""The week-by-week walk on the live run.
 
-The model flags, an analyst decides, the decision becomes a label, the
-model is retrained, and a better model takes over. This module walks
-that loop week by week over one dataset: score the week with the serving
-model, play the analyst as of the week's end, turn the verdicts into
-labels, watch the precision and the drift, and retrain when either
-fires.
+The serving model scores a week it never saw; the analyst's verdicts
+become labels; a fall or a drift starts a challenger; and the challenger
+takes over only when the intervals of the two are separated. With 35
+errors that will rarely happen, and a promotion on overlapping
+intervals is the mistake this project exists to avoid.
 
-Three things keep the story honest.
-
-- The floor comes from the training years: the tenth percentile of the
-  weekly precision a healthy champion reaches. Nothing is guessed.
-- Drift compares a week to the eight weeks before it, so one small week
-  cannot ring the bell alone.
-- A challenger is judged on the weeks since it was trained, never on
-  the held-out year. The held-out year stays the one-off final number.
-  The verdict is offline: each week's top five, from each model, is
-  checked against the answer key, because the desk's own verdicts
-  mature too slowly to judge four weeks. While a challenger waits for
-  its verdict, no new retraining starts.
-
-Decisions mature: a flag takes days to decide, so every week the
-verdicts are rebuilt as of that week's end, and a week's precision grows
-with the evidence. A retraining whose labels hold one class keeps the
-serving model: there is nothing to learn, and the trigger is recorded.
+The verdict reads recall: a desk buys a model for the errors it finds.
+Precision is reported beside it, because a recall won by flagging
+everything is no use.
 """
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from data import load
-from evaluation import splits, watch
-from models import feedback, lifecycle, scoring, train
+from evaluation import intervals, metrics, splits, watch as watch_mod
+from models import feedback, lifecycle, rules, scoring
+from models import train as train_module
 
-#: How many weeks judge a challenger before the desk decides.
+#: Weeks a challenger is judged on before the desk decides.
 CHALLENGE_WEEKS = 4
 
-#: How many weeks of history the drift comparison looks back on.
+#: Weeks of history the drift comparison looks back on.
 DRIFT_WEEKS = 8
 
-#: Features that move with the calendar, not with the world: a vendor
-#: ages a day every day, and the thirty-day count ramps as history
-#: fills. They would ring forever and say nothing.
+#: Features that move with the calendar, not with the world.
 CLOCKS = ('vendor_age_days', 'invoices_30d')
+
+#: Invoices the desk checks first each week.
+CHECKED = metrics.K
+
+
+def _matrix(table, features):
+    """The columns the serving model reads: the cut, or all of them
+    when a caller handed a model of its own."""
+    if features:
+        return table[list(features)].fillna(0)
+    return train_module._matrix(table)
+
+
+def _week_start(dates):
+    return (dates.dt.normalize()
+            - pd.to_timedelta(dates.dt.weekday, unit='D'))
+
+
+def _week_text(week):
+    if hasattr(week, 'strftime'):
+        return week.strftime('%Y-%m-%d')
+    return int(week)
+
+
+#: Below this many distinct scores in a week, the model is not ranking.
+TELLING = 3
+
+
+def _ranking(model, week, features):
+    """The week's scores, from the model when it ranks at all.
+
+    Trained on weeks where almost no error has come to light yet, the
+    model answers the same number for every invoice. A constant is not
+    a ranking: the week's top five would then be whichever rows sorted
+    first. When that happens the clerk's own checks rank the week, and
+    they are the baseline the model has to beat anyway.
+    """
+    scores = model.predict_proba(_matrix(week, features))[:, 1]
+    if len(np.unique(np.round(scores, 6))) >= TELLING:
+        return scores
+    return rules.score(week).to_numpy()
+
+
+def _redecided(frame, data, as_of):
+    """The same scored rows, with the verdicts as they stand today.
+
+    Only the verdict moves. The score, the flag and the checks were
+    decided by the model on duty that week and are history.
+    """
+    decided, decided_on = scoring._decisions(frame, data, as_of)
+    return frame.assign(decision=decided, decided_on=decided_on)
 
 
 def _slice(data, numbers):
@@ -63,132 +102,252 @@ def _precision(rows):
     return float((rows.loc[allowed, 'decision'] == 'confirmed').mean())
 
 
-def _top_precision(table, scores, k=5):
-    """Share of one week's top k that are real errors, from the key."""
-    top = (table.assign(score=scores)
-           .sort_values('score', ascending=False, kind='stable').head(k))
-    return float(top['is_anomaly'].mean())
+def _called(scores, k=CHECKED):
+    """The top k of one week, by score: what the desk checks."""
+    order = np.argsort(-np.asarray(scores), kind='stable')
+    called = np.zeros(len(order), dtype=int)
+    called[order[:k]] = 1
+    return called
 
 
-def training_floor(model, names=('year-seed1', 'year-seed2', 'year-seed3',
-                                 'year-seed4')):
-    """The tenth percentile of the champion's weekly precision, on the
-    training years with every decision matured."""
-    frames = []
-    for name in names:
-        data = load.read(name)
-        built = train.table_for(data, name)
-        built = built.assign(week=splits.week_of(built))
-        scores = model.predict_proba(train._matrix(built))[:, 1]
-        scored = scoring.rows(built, data, scores,
-                              as_of=built['issue_date'].max())
-        frames.append(watch.weekly(scored))
-    return watch.floor_from(pd.concat(frames, ignore_index=True))
+def _clean(value):
+    if isinstance(value, dict):
+        return {key: _clean(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clean(item) for item in value]
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    if hasattr(value, 'item'):
+        return value.item()
+    return value
 
 
-def run(table, data, held_out, model, promote, seed=0, k=5, floor=watch.FLOOR,
-        run_length=watch.RUN, line=watch.LINE, challenge_weeks=CHALLENGE_WEEKS):
-    """Walk the loop over every week, in order.
+def _log(path, entry):
+    """One JSON line per week, with a timestamp that carries its zone."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = {'at': datetime.now(timezone.utc).astimezone().isoformat(),
+            **entry}
+    with path.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(_clean(line)) + '\n')
 
-    `table` carries a `week` column. `model` is the serving model, and
-    `promote(model, verdict)` is called once a challenger wins its
-    weeks, to register it. `held_out` is kept for the final report and
-    is not used to judge a challenger. Returns the events, the weekly
-    watch as of the last week, the last drift per feature, and every
-    scored row, in week order.
+
+def _first_trainable(table, starts):
+    """The first week whose past weeks carry both a real error and a
+    clean invoice by the week's end. Before that there is nothing to
+    learn from, so nothing is scored."""
+    for position, week in enumerate(starts):
+        past = table[table['week'] < week]
+        if not len(past):
+            continue
+        as_of = week + pd.Timedelta(days=6)
+        if splits.known_labels(past, as_of).nunique() >= 2:
+            return position
+    return len(starts)
+
+
+def training_floor(model, table, data, features=None, share=0.7):
+    """The tenth percentile of the model's weekly precision on the
+    early weeks: what a healthy model reaches on this run."""
+    train_part, _ = splits.by_time(table, share=share)
+    as_of = train_part['issue_date'].max()
+    scores = model.predict_proba(_matrix(train_part, features))[:, 1]
+    scored = scoring.rows(train_part,
+                          _slice(data, set(train_part['number'])),
+                          scores, as_of=as_of)
+    return watch_mod.floor_from(watch_mod.weekly(scored))
+
+
+def run(table, data, held_out=None, model=None, promote=None, seed=0,
+        floor=watch_mod.FLOOR, run_length=watch_mod.RUN, line=watch_mod.LINE,
+        challenge_weeks=CHALLENGE_WEEKS, out=None, log=None, state=None,
+        weeks=None, features=None):
+    """Walk the run week by week.
+
+    `model` is the serving model; with none, the walk starts at the
+    first week whose past can train one, and trains it there. Returns
+    one event per scored week, in order.
     """
+    live = model is None
+    table = table.copy()
+    if 'week' not in table:
+        table['week'] = _week_start(table['issue_date'])
+    starts = sorted(table['week'].unique())
+    if model is None:
+        starts = starts[_first_trainable(table, starts):]
+    # What earlier runs left behind: a run stopped and started again
+    # carries its counts and its weekly history on, not from zero.
+    earlier = {'retrainings': 0, 'promotions': 0, 'weekly': []}
+    if state is not None and Path(state).exists():
+        saved = json.loads(Path(state).read_text(encoding='utf-8'))
+        earlier = {'retrainings': int(saved.get('retrainings', 0)),
+                   'promotions': int(saved.get('promotions', 0)),
+                   'weekly': list(saved.get('weekly') or [])}
+        last = saved.get('last_week')
+        if last:
+            starts = [week for week in starts if _week_text(week) > last]
+    if weeks is not None:
+        starts = starts[:weeks]
+
+    existing = None
+    if out is not None and Path(out).exists():
+        existing = pd.read_csv(out, keep_default_na=False)
+        # Only this command's rows may stay: a row without `scored_on`
+        # was written by something else, and merging it would put an
+        # invoice nobody walked into the dashboard's file.
+        if 'scored_on' in existing:
+            existing = existing[existing['scored_on'].astype(str) != '']
+        else:
+            existing = None
+    done = []
     events = []
-    drift_by_feature = {}
-    weeks = sorted(table['week'].unique())
-    slices = []
-    scored = None
+    trained_to = None
+    weeks_trained = 0
     pending = None
     cooling = 0
-    for week in weeks:
-        this_week = table[table['week'] == week].reset_index(drop=True)
-        as_of = this_week['issue_date'].max() + pd.Timedelta(days=6)
-        scores = model.predict_proba(train._matrix(this_week))[:, 1]
-        data_week = _slice(data, set(this_week['number']))
-        slices.append((this_week, data_week, scores))
-        rebuilt = [scoring.rows(t, d, s, k=k, as_of=as_of)
-                   for t, d, s in slices]
-        scored = pd.concat(rebuilt, ignore_index=True)
-        serving_precision = _precision(rebuilt[-1])
-        seen = pd.concat([t for t, _, _ in slices], ignore_index=True)
-        joined = seen.merge(
-            scored[['number', 'flagged', 'decision', 'decided_on']],
-            on='number', how='left')
-        labels = feedback.labels_from(joined, as_of)
+    drift_by = {}
+    for week in starts:
+        this = table[table['week'] == week].reset_index(drop=True)
+        as_of = this['issue_date'].max() + pd.Timedelta(days=6)
+        if model is None:
+            past = table[table['week'] < week]
+            labels = splits.known_labels(past, as_of)
+            model, _ = lifecycle.retrain(past, as_of, labels, seed=seed,
+                                         features=features)
+            trained_to = past['issue_date'].max()
+            weeks_trained = int(past['week'].nunique())
+            floor = training_floor(model, table, data, features)
 
-        over = []
-        if len(slices) > DRIFT_WEEKS:
-            window = [t for t, _, _ in slices[-1 - DRIFT_WEEKS:-1]]
-            held = watch.drift(pd.concat(window, ignore_index=True), this_week)
-            drift_by_feature = {name: score for name, score in held.items()
-                                if name not in CLOCKS}
-            over = watch.drifted(drift_by_feature, line)
-
-        current_weekly = watch.weekly(scored)
-        row_for_week = current_weekly.iloc[-1]
-        slipping = watch.slipping(current_weekly, floor, run_length)
+        scores = _ranking(model, this, features)
+        data_week = _slice(data, set(this['number']))
+        rows = scoring.rows(this, data_week, scores, k=CHECKED, as_of=as_of)
+        rows = rows.assign(scored_on=_week_text(week),
+                           model_weeks=weeks_trained)
+        done.append(rows)
+        # A verdict matures: an error takes days or months to come to
+        # light, so a flag decided this week is still open next week.
+        # Deciding each week once and never again left every real error
+        # marked open for ever, and the precision watch read zero on a
+        # run where the ranking was catching errors.
+        done = [_redecided(frame, data, as_of) for frame in done]
 
         promoted = False
+        separated = False
         challenger_precision = None
         verdict_served = None
         if pending is not None:
             challenger_scores = pending['model'].predict_proba(
-                train._matrix(this_week))[:, 1]
-            pending['weeks'].append((this_week, challenger_scores, scores))
+                _matrix(this, features))[:, 1]
+            pending['weeks'].append((
+                this['is_anomaly'].to_numpy(dtype=int),
+                _called(scores), _called(challenger_scores)))
             if len(pending['weeks']) >= challenge_weeks:
-                served = float(np.mean(
-                    [_top_precision(t, old, k)
-                     for (t, _, old) in pending['weeks']]))
-                offered = float(np.mean(
-                    [_top_precision(t, new, k)
-                     for (t, new, _) in pending['weeks']]))
-                if offered > served:
+                truth = np.concatenate([w[0] for w in pending['weeks']])
+                served_calls = np.concatenate([w[1] for w in pending['weeks']])
+                challenger_calls = np.concatenate([w[2] for w in pending['weeks']])
+                served_range = intervals.around(metrics.recall, truth,
+                                                served_calls)
+                challenger_range = intervals.around(metrics.recall, truth,
+                                                    challenger_calls)
+                separated = intervals.separated(challenger_range, served_range)
+                if (separated
+                        and metrics.recall(truth, challenger_calls)
+                        > metrics.recall(truth, served_calls)):
                     model = pending['model']
+                    trained_to = pending['trained_to']
+                    weeks_trained = pending['weeks_trained']
                     promoted = True
-                    challenger_precision = offered
-                    verdict_served = served
-                    promote(model, {'challenger_precision': offered,
-                                    'serving_precision': served})
+                    verdict = {
+                        'challenger_precision': metrics.precision(
+                            truth, challenger_calls),
+                        'serving_precision': metrics.precision(
+                            truth, served_calls)}
+                    challenger_precision = verdict['challenger_precision']
+                    verdict_served = verdict['serving_precision']
+                    if promote is not None:
+                        promote(model, verdict)
                 pending = None
 
+        weekly = watch_mod.weekly(pd.concat(done, ignore_index=True))
+        over = []
+        previous = [start for start in sorted(table['week'].unique())
+                    if start < week][-DRIFT_WEEKS:]
+        if len(previous) >= DRIFT_WEEKS:
+            window = table[table['week'].isin(previous)]
+            held = watch_mod.drift(window, this)
+            drift_by = {name: value for name, value in held.items()
+                        if name not in CLOCKS}
+            over = watch_mod.drifted(drift_by, line)
+        slipping = (floor is not None
+                    and watch_mod.slipping(weekly, floor, run_length))
+        trigger = 'precision' if slipping else ('drift' if over else None)
         retrained = False
         if cooling > 0:
             cooling -= 1
-        elif pending is None and (slipping or over):
+        elif pending is None and trigger is not None:
             retrained = True
+            seen = table[table['week'] <= week].reset_index(drop=True)
+            merged = seen.merge(
+                pd.concat(done, ignore_index=True)[
+                    ['number', 'flagged', 'decision', 'decided_on']],
+                on='number', how='left')
+            labels = feedback.labels_from(merged, as_of)
             try:
-                challenger, _ = lifecycle.retrain(seen, as_of, labels,
-                                                  seed=seed)
-                pending = {'model': challenger, 'weeks': []}
-                cooling = challenge_weeks
+                if live:
+                    challenger, _ = lifecycle.retrain(
+                        seen, as_of, labels, seed=seed, features=features)
+                else:
+                    challenger, _ = lifecycle.retrain(
+                        seen, as_of, labels, seed=seed)
+                pending = {'model': challenger, 'weeks': [],
+                           'trained_to': seen['issue_date'].max(),
+                           'weeks_trained': int(seen['week'].nunique())}
+                cooling = challenge_weeks + 1
             except ValueError:
                 pass
 
-        events.append({
-            'week': week,
-            'flagged': int(rows_flagged(this_week, scored)),
-            'confirmed': int(row_for_week['confirmed']),
-            'decided': int(row_for_week['decided']),
-            'precision': (float(row_for_week['precision'])
-                          if pd.notna(row_for_week['precision'])
-                          else float('nan')),
-            'top_precision': _top_precision(this_week, scores, k),
-            'serving_precision': serving_precision,
+        event = {
+            'week': _week_text(week),
+            'checked': int(rows['flagged'].sum()),
+            'confirmed': int((rows['decision'] == 'confirmed').sum()),
+            'dismissed': int((rows['decision'] == 'dismissed').sum()),
+            'trained_to': _week_text(trained_to) if trained_to is not None
+            else None,
+            'retrained': retrained,
+            'because': trigger if retrained else None,
+            'promoted': promoted,
+            'separated': separated,
             'challenger_precision': challenger_precision,
             'verdict_served': verdict_served,
-            'drifted': ','.join(over),
-            'retrained': retrained,
-            'promoted': promoted,
-        })
-    weekly = watch.weekly(scored)
-    return events, weekly, drift_by_feature, scored
-
-
-def rows_flagged(this_week, scored):
-    """How many rows of the newest week were flagged in it."""
-    numbers = set(this_week['number'])
-    return int(scored[scored['number'].isin(numbers)]['flagged'].sum())
+        }
+        events.append(event)
+        if out is not None:
+            frames = ([existing] if existing is not None else []) + done
+            whole = (pd.concat(frames, ignore_index=True)
+                     .drop_duplicates('number', keep='last'))
+            Path(out).parent.mkdir(parents=True, exist_ok=True)
+            whole.to_csv(out, index=False)
+        if log is not None:
+            _log(log, {'command': 'watch', **event})
+        if state is not None:
+            # The gauges are served from this file between runs, so it
+            # carries what the week left behind, not only the place.
+            promotions = (earlier['promotions']
+                          + sum(1 for e in events if e['promoted']))
+            now = watch_mod.weekly(
+                pd.concat(done, ignore_index=True)).to_dict('records')
+            walked = {str(row['week']) for row in now}
+            history = [row for row in earlier['weekly']
+                       if str(row['week']) not in walked] + now
+            Path(state).write_text(json.dumps({
+                'last_week': _week_text(week),
+                'retrainings': (earlier['retrainings']
+                                + sum(1 for e in events if e['retrained'])),
+                'promotions': promotions,
+                'champion_version': promotions + 1,
+                'drift': {name: float(value)
+                          for name, value in drift_by.items()},
+                'weekly': history,
+            }, default=str), encoding='utf-8')
+    weekly = watch_mod.weekly(pd.concat(done, ignore_index=True)) if done else None
+    return events, weekly, drift_by if events else {}, done

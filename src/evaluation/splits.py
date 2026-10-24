@@ -31,3 +31,40 @@ def prequential(table, first_week=8, test_weeks=1):
         test = table.index[(weeks >= start) & (weeks < start + test_weeks)]
         if len(test):
             yield train, test
+
+
+def by_time(table, share=None, cutoff=None):
+    """The past trains, the future tests, never the other way round.
+
+    One of `share` and `cutoff` decides where the line falls; both or
+    neither is a mistake. A test side with no errors cannot measure
+    anything, so it is refused instead of scored.
+    """
+    if (share is None) == (cutoff is None):
+        raise ValueError('give exactly one of share and cutoff')
+    dated = table.sort_values('issue_date', kind='stable')
+    if cutoff is None:
+        if not 0 < share < 1:
+            raise ValueError('share must be between 0 and 1')
+        position = max(1, min(len(dated) - 1, int(round(len(dated) * share))))
+        cut = pd.Timestamp(dated['issue_date'].iloc[position - 1])
+    else:
+        cut = pd.Timestamp(cutoff)
+    train = dated[dated['issue_date'] <= cut]
+    test = dated[dated['issue_date'] > cut]
+    if not len(test) or not test['is_anomaly'].sum():
+        raise ValueError('the test side has no errors')
+    return train, test
+
+
+def describe(table, share=None, cutoff=None):
+    """The dates and the error count on each side, and where the line fell."""
+    train, test = by_time(table, share=share, cutoff=cutoff)
+
+    def side(part):
+        return {'first': part['issue_date'].min(),
+                'last': part['issue_date'].max(),
+                'errors': int(part['is_anomaly'].sum())}
+
+    return {'cutoff': train['issue_date'].max(),
+            'train': side(train), 'test': side(test)}

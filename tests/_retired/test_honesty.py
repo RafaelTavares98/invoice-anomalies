@@ -1,3 +1,4 @@
+# Retired 2026-10-19: it measured leakage on the five invented years, and those sets are gone.
 """Two ways to break the score on purpose. A model that cannot cheat
 when handed the answer is not learning, and a model that scores well on
 shuffled labels is reading something it should not."""

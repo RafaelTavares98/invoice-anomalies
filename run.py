@@ -1,310 +1,406 @@
-"""Find anomalies in the invoices project 01 simulates.
+"""The commands that keep the project running on Moty's own run.
 
-    python run.py features        build and cache the feature tables
-    python run.py walk            week by week over seeds 1 to 4
-    python run.py compare         train on seeds 1 to 4, test on seed 5,
-                                  every model recorded in MLflow
-    python run.py retrain [DATASET]
-                                  retrain on the analyst's verdicts, then
-                                  challenge the champion on the held-out year
-    python run.py loop [DATASET]  the whole story: score, decide, watch,
-                                  retrain, promote; drift-seed7 by default
-    python run.py score [DATASET] [FILE]
-                                  the champion scores one dataset for the
-                                  dashboard (busy-seed2026, into project 03)
-    python run.py metrics [PORT]  the scored file as Prometheus gauges (9109)
-    python run.py ui              open the MLflow screen on port 5000
+    python run.py prepare [--out FILE]   load the run, build and cut the
+                                         features, write the table
+    python run.py train [--table FILE]   split by time, fit every model
+                                         and the clerk's checks, report
+    python run.py score [--table FILE] [--out FILE]
+                                         one model over the whole run,
+                                         into data/scored.csv
+    python run.py watch [--table FILE] [--out FILE] [--state FILE]
+                                         walk the run week by week, and
+                                         keep going; the only writer of
+                                         the dashboard's file
+    python run.py serve [--port N]       the gauges, kept up
 
-Seed 5 is held out: no model, setting or rule is tuned on it. Make the
-datasets first, in project 01: python run.py dataset year 1 2 3 4 5
+Every command appends one JSON line to data/runs.log, so days of
+running stay readable.
 """
 
-import subprocess
+import json
+import math
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE / 'src'))
 
+import numpy as np                                   # noqa: E402
 import pandas as pd                                  # noqa: E402
 
 from data import load                                # noqa: E402
-from evaluation import splits                        # noqa: E402
-from models import feedback, lifecycle, scoring, train  # noqa: E402
+from evaluation import intervals, metrics, splits    # noqa: E402
+from features import build                           # noqa: E402
+from models import exporter, rules, scoring, train as train_module  # noqa: E402
 
-CACHE = HERE / 'data' / 'features'
-TRACKING = f'sqlite:///{(HERE / "mlflow.db").as_posix()}'
-TRAIN_SEEDS = ('year-seed1', 'year-seed2', 'year-seed3', 'year-seed4')
-HELD_OUT = 'year-seed5'
+#: The one run this project reads.
+LIVE = HERE.parent / '01-invoice-pipeline' / 'Invoices' / 'live'
 
+DATA = HERE / 'data'
+TABLE = DATA / 'features.csv'
+REPORT = DATA / 'model-report.json'
+LOG = DATA / 'runs.log'
 
-def table(name):
-    """One dataset's features and answers, cached as a CSV."""
-    path = CACHE / f'{name}.csv'
-    if path.exists():
-        return pd.read_csv(path, parse_dates=['issue_date'], keep_default_na=False,
-                           na_values=[''])
-    CACHE.mkdir(parents=True, exist_ok=True)
-    built = train.table_for(load.read(name), name)
-    built.to_csv(path, index=False)
-    return pd.read_csv(path, parse_dates=['issue_date'], keep_default_na=False,
-                       na_values=[''])
+#: Where the dashboard of project 03 reads the scored rows. Only
+#: `watch` writes it, so the file always says which model produced it.
+SCORED = HERE.parent / '03-payables-panel' / 'data' / 'anomalies.csv'
 
+#: Where `score` writes its one-model pass, kept inside this project.
+SCORE_FILE = DATA / 'scored.csv'
 
-def _text(frame):
-    for column in ('anomaly', 'lookalike_of'):
-        frame[column] = frame[column].fillna('')
-    return frame
+#: Where watch keeps its place between runs.
+WATCH_STATE = DATA / 'watch-state.json'
 
+#: The share of the run that trains; the rest is tested, later in time.
+SHARE = 0.7
 
-def compare():
-    seen = pd.concat([table(n) for n in TRAIN_SEEDS], ignore_index=True)
-    held = table(HELD_OUT)
-    results = train.compare(_text(seen), _text(held), tracking_uri=TRACKING,
-                            log_models=True,
-                            description='Train on seeds 1 to 4, test on held-out seed 5.')
-    width = max(map(len, results))
-    print(f'{"model":<{width}}  top 5  recall@25  avg precision')
-    for name, found in results.items():
-        print(f'{name:<{width}}  {found["precision_at_k"]:>5.2f}  '
-              f'{found["recall_at_25"]:>9.2f}  {found["average_precision"]:>13.2f}')
-    best = results['lightgbm']
-    promoted = lifecycle.register_if_better(
-        f'runs:/{best["run_id"]}/model', round(best['average_precision'], 4),
-        tracking_uri=TRACKING, features=train.COLUMNS)
-    print('lightgbm', 'is the new champion' if promoted else 'stays challenger')
+#: Invoices the desk checks first each week, the ranking's own budget.
+CHECKED = metrics.K
+
+#: Points on the caught-as-more-are-checked curve.
+STEP = 25
 
 
-def walk():
-    """Week by week over the four training years, each fold in MLflow."""
-    import mlflow
-    seen = _text(pd.concat([table(n) for n in TRAIN_SEEDS], ignore_index=True))
-    mlflow.set_tracking_uri(TRACKING)
-    mlflow.set_experiment(train.EXPERIMENT)
-    with mlflow.start_run(run_name='walk-forward'):
-        for name in ('rules', 'lightgbm'):
-            with mlflow.start_run(run_name=f'walk-{name}', nested=True):
-                folds = lifecycle.walk_forward(seen, name)
-                for fold in folds:
-                    mlflow.log_metrics({k: v for k, v in fold.items() if k != 'week'},
-                                       step=fold['week'])
-                mean = sum(f['average_precision'] for f in folds) / len(folds)
-                worst = min(f['average_precision'] for f in folds)
-                mlflow.log_metrics({'mean_average_precision': mean,
-                                    'worst_average_precision': worst})
-                print(f'{name:<9} {len(folds)} folds, average precision '
-                      f'mean {mean:.2f}, worst {worst:.2f}')
+def _log(path, entry):
+    """One JSON line per command, with a timestamp that carries its zone."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = {'at': datetime.now(timezone.utc).astimezone().isoformat(),
+            **entry}
+    with path.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(_clean(line)) + '\n')
 
 
-#: The corpus the README of project 01 describes, and the dashboard shows.
-DASHBOARD = 'busy-seed2026'
-DASHBOARD_FILE = HERE.parent / '03-payables-panel' / 'data' / 'anomalies.csv'
-
-#: What the loop wrote last: precision, drift, retrainings, champion.
-LOOP_STATE = HERE.parent / '03-payables-panel' / 'data' / 'loop-state.json'
-
-
-def score(name=DASHBOARD, out=DASHBOARD_FILE):
-    """Score one dataset with the champion, for the dashboard."""
-    import mlflow
-    from models import scoring
-    mlflow.set_tracking_uri(TRACKING)
-    champion = mlflow.lightgbm.load_model(f'models:/{lifecycle.NAME}@champion')
-    data = load.read(name)
-    built = train.table_for(data, name)
-    scores = champion.predict_proba(train._matrix(built))[:, 1]
-    found = scoring.rows(built, data, scores)
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-    found.to_csv(out, index=False)
-    print(f'{len(found)} invoices scored, {int(found.flagged.sum())} flagged, '
-          f'into {out}')
+def _clean(value):
+    """What json can carry: no NaN, no numpy, dates as text."""
+    if isinstance(value, dict):
+        return {key: _clean(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clean(item) for item in value]
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if hasattr(value, 'isoformat'):
+        return value.isoformat()
+    if hasattr(value, 'item'):
+        return value.item()
+    return value
 
 
-def retrain(name='drift-seed7'):
-    """Score a dataset, retrain on the analyst's verdicts, challenge on
-    the held-out year, and register the winner. Prints four lines: the
-    weeks trained on, the champion's score, the challenger's score, and
-    which one serves now."""
-    import mlflow
-    from mlflow.models import infer_signature
-    mlflow.set_tracking_uri(TRACKING)
-    client = mlflow.MlflowClient()
-    data = load.read(name)
-    held = table(HELD_OUT)
-    built = train.table_for(data, name)
-    champion = mlflow.lightgbm.load_model(f'models:/{lifecycle.NAME}@champion')
-    scores = champion.predict_proba(train._matrix(built))[:, 1]
-    as_of = built['issue_date'].max()
-    rows = scoring.rows(built, data, scores, as_of=as_of)
-    joined = built.merge(rows[['number', 'flagged', 'decision',
-                               'decided_on']], on='number', how='left')
-    labels = feedback.labels_from(joined, as_of)
-    model, seen = lifecycle.retrain(built, as_of, labels)
-    found = lifecycle.challenge(model, held)
-    before = client.get_model_version_by_alias(lifecycle.NAME, 'champion')
-    champion_score = float(before.tags.get('average_precision', '-inf'))
-    with mlflow.start_run(run_name=f'retrain-{name}'):
-        mlflow.log_metrics(found)
-        sample = train._matrix(seen).head(5)
-        mlflow.lightgbm.log_model(
-            model, name='model',
-            signature=infer_signature(sample, model.predict_proba(sample)[:, 1]),
-            input_example=sample)
-        promoted = lifecycle.register_if_better(
-            f'runs:/{mlflow.active_run().info.run_id}/model',
-            round(found['average_precision'], 4), tracking_uri=TRACKING,
-            features=train.COLUMNS)
-    serving = client.get_model_version_by_alias(lifecycle.NAME, 'champion')
-    print(f'trained on {splits.week_of(seen).nunique()} weeks, '
-          f'{seen["issue_date"].min().date()} to {seen["issue_date"].max().date()}')
-    print(f'champion: average precision {champion_score:.4f}')
-    print(f'challenger: average precision {found["average_precision"]:.4f}')
-    print(('challenger wins: version '
-           f'{serving.version} serves now') if promoted else
-          (f'challenger stays challenger: version '
-           f'{serving.version} still serves'))
+def _option(words, name, default):
+    if name in words:
+        place = words.index(name) + 1
+        if place < len(words):
+            return Path(words[place])
+    return Path(default)
 
 
-def loop(name='drift-seed7', out=DASHBOARD_FILE):
-    """The whole story on one command: score, decide, watch, retrain,
-    promote. Prints the fall, the retrainings, the promotion and the
-    recovery; writes the scored rows the exporter reads."""
-    import mlflow
-    from mlflow.models import infer_signature
-    from runs import loop as loop_mod
-    mlflow.set_tracking_uri(TRACKING)
-    data = load.read(name)
-    built = train.table_for(data, name)
-    built = built.assign(week=splits.week_of(built))
-    held = table(HELD_OUT)
-    champion = mlflow.lightgbm.load_model(f'models:/{lifecycle.NAME}@champion')
-    floor = loop_mod.training_floor(champion)
-
-    def promote(model, verdict):
-        report = lifecycle.challenge(model, held)
-        with mlflow.start_run(run_name='loop-retrain'):
-            mlflow.log_metrics(report)
-            sample = train._matrix(built).head(5)
-            mlflow.lightgbm.log_model(
-                model, name='model',
-                signature=infer_signature(sample,
-                                          model.predict_proba(sample)[:, 1]),
-                input_example=sample)
-            lifecycle.register(
-                f'runs:/{mlflow.active_run().info.run_id}/model',
-                tracking_uri=TRACKING,
-                score=round(report['average_precision'], 4),
-                features=train.COLUMNS)
-        return True
-
-    events, weekly, drifts, scored = loop_mod.run(
-        built, data, held, champion, promote, floor=floor)
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-    scored.to_csv(out, index=False)
-    retrainings = sum(1 for event in events if event['retrained'])
-    import json
-    serving = mlflow.MlflowClient().get_model_version_by_alias(
-        lifecycle.NAME, 'champion')
-    LOOP_STATE.write_text(json.dumps({
-        'last_precision': (float(weekly['precision'].dropna().iloc[-1])
-                           if weekly['precision'].notna().any() else None),
-        'drift': drifts,
-        'retrainings': retrainings,
-        'champion_version': str(serving.version),
-    }, indent=2), encoding='utf-8')
-    print(f'{len(events)} weeks, floor {floor:.2f}, '
-          f'{retrainings} retraining(s), into {out}')
-    series = ' '.join(f'{event["top_precision"]:.1f}' for event in events)
-    print(f'top-5 precision, week by week: {series}')
-    for event in events:
-        if event['retrained']:
-            print(f'  week {event["week"]}: retrained, drift '
-                  f'[{event["drifted"]}]')
-        if event['promoted']:
-            print(f'  week {event["week"]}: promoted on the weeks since '
-                  f'training, {event["challenger_precision"]:.2f} against '
-                  f'{event["verdict_served"]:.2f}')
-    promoted = [i for i, event in enumerate(events) if event['promoted']]
-    if promoted:
-        cut = promoted[0]
-        before = sum(e['top_precision'] for e in events[:cut]) / max(1, cut)
-        after = sum(e['top_precision'] for e in events[cut:]) / max(
-            1, len(events) - cut)
-        print(f'recovery: top-5 precision {before:.2f} before the '
-              f'promotion, {after:.2f} after')
+def _load_table(path):
+    table = pd.read_csv(path, keep_default_na=False)
+    table['issue_date'] = pd.to_datetime(table['issue_date'])
+    for column in build.COLUMNS:
+        table[column] = pd.to_numeric(table[column], errors='coerce')
+    table['is_anomaly'] = pd.to_numeric(table['is_anomaly']).astype(int)
+    table['found_after_days'] = pd.to_numeric(table['found_after_days'],
+                                              errors='coerce')
+    return table
 
 
-def metrics(port=None):
-    """The scored file as Prometheus gauges, for project 01's Grafana.
-    Serves until stopped; the file is read again every 30 seconds."""
+def _week_of(issue_dates):
+    return (issue_dates.dt.normalize()
+            - pd.to_timedelta(issue_dates.dt.weekday, unit='D'))
+
+
+def _top_called(table, scores, k=CHECKED):
+    """The share the desk checks: the top k of each week, by score."""
+    ranked = pd.Series(scores, index=table.index)
+    order = ranked.sort_values(ascending=False, kind='stable').index
+    weeks = _week_of(table['issue_date'])
+    called = pd.Series(0, index=table.index)
+    for week, places in weeks.groupby(weeks).groups.items():
+        candidates = [index for index in order if index in places][:k]
+        called.loc[candidates] = 1
+    return called.astype(int)
+
+
+def _average_precision_interval(truth, scores, seed=0, draws=2000):
+    """A figure read off the ranking needs its own resampling."""
+    truth = np.asarray(truth, dtype=int)
+    scores = np.asarray(scores, dtype=float)
+    rng = np.random.default_rng(seed)
+    values = []
+    for _ in range(draws):
+        picked = rng.integers(0, len(truth), len(truth))
+        value = metrics.pr_curve(truth[picked], scores[picked])['average_precision']
+        if not math.isnan(value):
+            values.append(value)
+    if not values:
+        return [float('nan'), float('nan')]
+    return [float(np.quantile(values, 0.025)), float(np.quantile(values, 0.975))]
+
+
+def _caught_by_checked(truth, scores, step=STEP):
+    """Errors caught as the ranking is read from the top down."""
+    ranked = np.asarray(truth, dtype=int)[np.argsort(-np.asarray(scores),
+                                                        kind='stable')]
+    caught = np.cumsum(ranked)
+    points = [[0, 0]]
+    for checked in range(step, len(ranked) + 1, step):
+        points.append([checked, int(caught[checked - 1])])
+    return points
+
+
+def prepare(out=TABLE, log=LOG):
+    """Load the run, build the features, cut them, write the table."""
+    data = load.live(LIVE)
+    table = build.features(data)
+    answers = data.labels[['number', 'anomaly', 'lookalike_of',
+                           'found_after_days', 'is_anomaly']]
+    table = table.merge(answers, on='number', how='left')
+    kept = build.cut(table)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    columns = ['number', 'issue_date', 'anomaly', 'lookalike_of',
+               'found_after_days', 'is_anomaly', *build.COLUMNS]
+    table[columns].to_csv(out, index=False)
+    out.with_suffix('.meta.json').write_text(
+        json.dumps({'kept': kept, 'order': list(build.COLUMNS)}),
+        encoding='utf-8')
+    report = {
+        'rows': len(table),
+        'errors': int(table['is_anomaly'].sum()),
+        'features_before': len(build.COLUMNS),
+        'features_after': len(kept),
+        'kept': kept,
+        'order': list(build.COLUMNS),
+    }
+    _log(log, {'command': 'prepare', 'table': str(out), **report})
+    return report
+
+
+def _fit_scores(train_part, test_part, kept, cutoff):
+    """Every model's ranking of the test invoices, biggest first."""
+    scores = {}
+    truth_label = splits.known_labels(train_part, cutoff)
+    scores['rules'] = rules.score(
+        test_part, rules.learn_weights(train_part, cutoff)).to_numpy()
+
+    from lightgbm import LGBMClassifier
+    booster = LGBMClassifier(**train_module.Boosting.params)
+    booster.fit(train_part[kept].fillna(0), truth_label)
+    scores['lightgbm'] = booster.predict_proba(test_part[kept].fillna(0))[:, 1]
+
+    from pyod.models.ecod import ECOD
+    from pyod.models.iforest import IForest
+    matrix_train = train_part[kept].fillna(0).to_numpy(dtype=float)
+    matrix_test = test_part[kept].fillna(0).to_numpy(dtype=float)
+    forest = IForest(**train_module.Isolation.params)
+    forest.fit(matrix_train)
+    scores['isolation_forest'] = forest.decision_function(matrix_test)
+    ecod = ECOD()
+    ecod.fit(matrix_train)
+    scores['ecod'] = ecod.decision_function(matrix_test)
+    return scores
+
+
+def train(table=TABLE, log=LOG, report_path=REPORT):
+    """Split by time, fit every model, report every figure with its interval."""
+    table = _load_table(table)
+    train_part, test_part = splits.by_time(table, share=SHARE)
+    cutoff = train_part['issue_date'].max()
+    detail = splits.describe(table, share=SHARE)
+    kept = build.cut(train_part, cutoff=cutoff)
+    truth = test_part['is_anomaly'].to_numpy(dtype=int)
+    kinds = test_part['anomaly'].fillna('').to_numpy()
+
+    models = {}
+    for name, scores in _fit_scores(train_part, test_part, kept, cutoff).items():
+        called = _top_called(test_part, scores)
+        p = metrics.precision(truth, called)
+        r = metrics.recall(truth, called)
+        f = metrics.f1(truth, called)
+        ap = metrics.pr_curve(truth, scores)['average_precision']
+        models[name] = {
+            'confusion': metrics.confusion(truth, called),
+            'precision': {'value': p,
+                          'interval': intervals.around(metrics.precision,
+                                                       truth, called)},
+            'recall': {'value': r,
+                       'interval': intervals.around(metrics.recall,
+                                                    truth, called)},
+            'f1': {'value': f,
+                   'interval': intervals.around(metrics.f1,
+                                                truth, called)},
+            'average_precision': {
+                'value': ap,
+                'interval': _average_precision_interval(truth, scores)},
+            'recall_by_kind': metrics.recall_by_kind(truth, called, kinds),
+            'caught_by_checked': _caught_by_checked(truth, scores),
+        }
+
+    sides = {
+        side: {'first': detail[side]['first'].strftime('%Y-%m-%d'),
+               'last': detail[side]['last'].strftime('%Y-%m-%d'),
+               'errors': detail[side]['errors']}
+        for side in ('train', 'test')
+    }
+    report = {
+        'split': {'cutoff': cutoff.strftime('%Y-%m-%d'), **sides},
+        **sides,
+        'baseline': 'rules',
+        'models': models,
+    }
+    exporter.publish_report(report, report_path)
+    _log(log, {'command': 'train',
+               'train_errors': report['split']['train']['errors'],
+               'test_errors': report['split']['test']['errors'],
+               'features': len(kept)})
+    return report
+
+
+def score(table=TABLE, out=SCORE_FILE, log=LOG):
+    """Write one row per invoice, from one model fitted on the whole run."""
+    table = _load_table(table)
+    data = load.live(LIVE)
+    kept = build.cut(table)
+    from lightgbm import LGBMClassifier
+    booster = LGBMClassifier(**train_module.Boosting.params)
+    booster.fit(table[kept].fillna(0), table['is_anomaly'])
+    scores = booster.predict_proba(table[kept].fillna(0))[:, 1]
+    rows = scoring.rows(table, data, scores)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rows.to_csv(out, index=False)
+    _log(log, {'command': 'score', 'rows': len(rows), 'out': str(out)})
+    return rows
+
+
+def watch(table=TABLE, out=SCORED, log=LOG, state=None, weeks=None):
+    """Walk the run week by week, and keep going. Safe to stop.
+
+    The state is used only when asked for: a command run by hand starts
+    from the beginning unless it is given one. The feature cut is the
+    one `prepare` wrote beside the table, so the serving model and
+    every challenger read the same columns.
+    """
+    from runs import loop
+    table_frame = _load_table(table)
+    data = load.live(LIVE)
+    events, _, _, _ = loop.run(table_frame, data, out=out, log=log,
+                               state=state, weeks=weeks,
+                               features=_kept_for(table_frame, table))
+    return events
+
+
+def _kept_for(table_frame, table):
+    """The cut prepare wrote, else the cut this table allows."""
+    meta = Path(table).with_suffix('.meta.json')
+    if meta.exists():
+        return json.loads(meta.read_text(encoding='utf-8'))['kept']
+    return build.cut(table_frame)
+
+
+def _state_for_gauges():
+    """What the loop and the last measurement left behind.
+
+    Serving the scored file alone leaves four of the eight gauges unset,
+    and the dashboard's model panels then read empty while everything
+    else works. These three files hold the rest.
+    """
+    found = {'average_precision': None, 'weekly': None, 'drift': None,
+             'retrainings': 0, 'champion_version': None}
+    if REPORT.exists():
+        report = json.loads(REPORT.read_text(encoding='utf-8'))
+        baseline = report.get('baseline')
+        models = report.get('models') or {}
+        serving = models.get(baseline) or next(iter(models.values()), None)
+        if serving:
+            found['average_precision'] = serving['average_precision']['value']
+    if WATCH_STATE.exists():
+        state = json.loads(WATCH_STATE.read_text(encoding='utf-8'))
+        found['retrainings'] = state.get('retrainings', 0)
+        found['champion_version'] = state.get('champion_version')
+        found['drift'] = state.get('drift')
+        weekly = state.get('weekly')
+        if weekly:
+            found['weekly'] = pd.DataFrame(weekly)
+    return found
+
+
+def serve(port=None, log=LOG):
+    """Keep the gauges up for the dashboard to scrape."""
     import time
-    import mlflow
-    import pandas as pd
     from prometheus_client import CollectorRegistry, start_http_server
-    from models import exporter
-    mlflow.set_tracking_uri(TRACKING)
-    client = mlflow.MlflowClient()
-    precision = float(client.get_model_version_by_alias(
-        lifecycle.NAME, 'champion').tags['average_precision'])
-    holder = {'registry': CollectorRegistry()}
+
     port = int(port or exporter.PORT)
+    holder = {'registry': CollectorRegistry()}
 
     def refresh():
-        import json
         registry = CollectorRegistry()
-        state = {}
-        if LOOP_STATE.exists():
-            state = json.loads(LOOP_STATE.read_text(encoding='utf-8'))
-        weekly = None
-        if state.get('last_precision') is not None:
-            weekly = pd.DataFrame([{'precision': state['last_precision']}])
-        exporter.publish(registry, pd.read_csv(DASHBOARD_FILE,
-                                               keep_default_na=False),
-                         precision, weekly=weekly,
-                         drift=state.get('drift') or {},
-                         retrainings=state.get('retrainings', 0),
-                         champion_version=state.get('champion_version'))
+        scored = pd.read_csv(SCORED, keep_default_na=False)
+        exporter.publish(registry, scored, **_state_for_gauges())
         holder['registry'] = registry
-
-    refresh()
 
     class Live:
         def collect(self):
             return holder['registry'].collect()
 
+    try:
+        refresh()
+    except FileNotFoundError:
+        pass
     start_http_server(port, registry=Live())
-    print(f'anomaly metrics on http://localhost:{port}/metrics', flush=True)
+    _log(log, {'command': 'serve', 'port': port})
+    print(f'gauges on http://localhost:{port}/metrics', flush=True)
     while True:
         time.sleep(30)
-        refresh()
+        try:
+            refresh()
+        except FileNotFoundError:
+            pass
 
 
 def main():
-    if '--help' in sys.argv[1:]:
+    words = sys.argv[1:]
+    if not words or '--help' in words:
         print(__doc__)
         return
-    mode = sys.argv[1] if len(sys.argv) > 1 else 'compare'
-    if mode == 'features':
-        for name in (*TRAIN_SEEDS, HELD_OUT):
-            print(name, len(table(name)), 'invoices')
-    elif mode == 'compare':
-        compare()
-    elif mode == 'walk':
-        walk()
+    mode = words[0]
+    if mode == 'prepare':
+        report = prepare(out=_option(words, '--out', TABLE),
+                         log=_option(words, '--log', LOG))
+        print(json.dumps(_clean(report), indent=2))
+    elif mode == 'train':
+        report = train(table=_option(words, '--table', TABLE),
+                       log=_option(words, '--log', LOG))
+        print(json.dumps(_clean(report['split']), indent=2))
     elif mode == 'score':
-        score(*sys.argv[2:4])
-    elif mode == 'retrain':
-        retrain(*sys.argv[2:3])
-    elif mode == 'loop':
-        loop(*sys.argv[2:4])
-    elif mode == 'metrics':
-        metrics(*sys.argv[2:3])
-    elif mode == 'ui':
-        subprocess.run([sys.executable, '-m', 'mlflow', 'ui',
-                        '--backend-store-uri', TRACKING, '--port', '5000'])
+        score(table=_option(words, '--table', TABLE),
+              out=_option(words, '--out', SCORE_FILE),
+              log=_option(words, '--log', LOG))
+    elif mode == 'watch':
+        limit = None
+        if '--weeks' in words:
+            place = words.index('--weeks') + 1
+            if place < len(words):
+                limit = int(words[place])
+        watch(table=_option(words, '--table', TABLE),
+              out=_option(words, '--out', SCORED),
+              log=_option(words, '--log', LOG),
+              state=_option(words, '--state', WATCH_STATE),
+              weeks=limit)
+    elif mode == 'serve':
+        port = None
+        if '--port' in words:
+            place = words.index('--port') + 1
+            if place < len(words):
+                port = int(words[place])
+        serve(port=port, log=_option(words, '--log', LOG))
     else:
         sys.exit(__doc__)
 
 
 if __name__ == '__main__':
     main()
+
+

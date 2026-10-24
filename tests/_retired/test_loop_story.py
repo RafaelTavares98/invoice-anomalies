@@ -1,3 +1,4 @@
+# Retired 2026-10-19: it told the loop's story on drift-seed7, and that set is gone.
 """The loop tells a story on the drift dataset: a fall, a retrain or
 two, a promotion, and a recovery. Never a retrain every week."""
 

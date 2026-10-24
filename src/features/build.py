@@ -44,9 +44,49 @@ def features(data):
     out['round_thousands'] = ((total % 1000 == 0) & (total > 0)).astype(int)
     out['cents_zero'] = (total.round(2) % 1 == 0).astype(int)
     out['is_freight'] = (inv['kind'] == 'freight').astype(int)
-    out['is_customs'] = inv['kind'].isin(('customs', 'broker')).astype(int)
+    out['is_customs'] = (inv['kind'].isin(('customs', 'broker'))).astype(int)
     out['grand_total'] = total
     return out[['number', 'issue_date', *COLUMNS]]
+
+
+def cut(table, events_per_feature=10, cutoff=None):
+    """The features a model may use, bought with the errors it has.
+
+    Ten errors per feature is the usual rule of thumb. The budget is
+    spent on the features that move with the answer, strongest first,
+    and a feature that never moves is dropped whatever the budget is.
+    The cut is a training decision, so rows after the cutoff are refused
+    rather than quietly used.
+    """
+    if cutoff is not None:
+        cutoff = pd.Timestamp(cutoff)
+        if (pd.to_datetime(table['issue_date']) > cutoff).any():
+            raise ValueError(f'a row after the cutoff {cutoff.date()} was passed in')
+    errors = int(table['is_anomaly'].sum())
+    allowed = errors // events_per_feature
+    if allowed < 1:
+        raise ValueError('too few errors to buy a feature')
+    truth = table['is_anomaly'].to_numpy(dtype=float)
+    strength = {}
+    for column in COLUMNS:
+        values = pd.to_numeric(table[column], errors='coerce').fillna(0.0)
+        values = values.to_numpy(dtype=float)
+        if float(np.std(values)) == 0.0:
+            continue
+        # Ranks, not the values themselves. An amount runs to millions
+        # and carries a few huge outliers, and a plain correlation reads
+        # those as noise: the cut kept three weak flags and dropped
+        # every feature that actually marks an error.
+        ranks = pd.Series(values).rank().to_numpy(dtype=float)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            link = float(np.corrcoef(ranks, truth)[0, 1])
+        if not np.isnan(link):
+            strength[column] = abs(link)
+    order = {name: position for position, name in enumerate(COLUMNS)}
+    ranked = sorted(strength, key=lambda name: (-strength[name],
+                                                order[name]))
+    kept = set(ranked[:allowed])
+    return [column for column in COLUMNS if column in kept]
 
 
 # ------------------------------------------------------------- the customs

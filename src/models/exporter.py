@@ -10,6 +10,51 @@ from prometheus_client import Gauge
 PORT = 9109
 
 
+def publish_report(report, path):
+    """Write the figures the four panels are drawn from, and the verdict.
+
+    The panels need the intervals themselves, not gauges: two overlapping
+    intervals are a statement of their own, and the file says so.
+    """
+    import json
+    import math
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from evaluation import intervals
+
+    def clean(value):
+        if isinstance(value, dict):
+            return {key: clean(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clean(item) for item in value]
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        if hasattr(value, 'isoformat'):
+            return value.isoformat()
+        if hasattr(value, 'item'):
+            return value.item()
+        return value
+
+    baseline = report.get('baseline')
+    models = report.get('models') or {}
+    verdict = {'separated': False, 'winner': None}
+    others = [name for name in models if name != baseline]
+    if baseline in models and others:
+        best = max(others, key=lambda name: models[name]['average_precision']['value'])
+        found = intervals.compare(
+            baseline,
+            tuple(models[baseline]['average_precision']['interval']),
+            best, tuple(models[best]['average_precision']['interval']))
+        verdict = {'separated': found['separated'], 'winner': found['winner']}
+    written = {**report, 'verdict': verdict,
+               'written_at': datetime.now(timezone.utc).astimezone().isoformat()}
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(clean(written), indent=2), encoding='utf-8')
+    return path
+
+
 def publish(registry, scored, average_precision=None, weekly=None,
             drift=None, retrainings=0, champion_version=None):
     """Set every gauge from one scored table and the loop's state."""

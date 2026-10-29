@@ -9,7 +9,7 @@ first, and proves on measured evidence whether that is worth doing.
 **The invoices are filed at last. Some of them are wrong.**
 
 Moty imports cosmetics packaging from Asia: bottles, caps, pumps,
-labels. Its plant is in Louveira, a real city in São Paulo state; Moty
+labels. Its plant is in São Paulo state; Moty
 itself is invented. Factories, shipping lines, forwarders, a customs
 broker, a terminal and a truck company bill it.
 
@@ -179,12 +179,17 @@ python -m pytest -q
 python run.py prepare        load the run, build and cut the features
 python run.py train          split by time, fit every model, report
 python run.py score          one model over the whole run, into data/scored.csv
-python run.py watch          walk the run week by week; writes the dashboard's file
+python run.py watch          walk the run week by week, into data/anomalies.csv
 python run.py serve          keep the gauges up
 ```
 
 Every command appends one JSON line to `data/runs.log`, so days of
 running stay readable.
+
+`watch` is the only writer of `data/anomalies.csv`, the file the landed
+cost dashboard shows. It picks up where it left off, so running it twice
+costs nothing. The dashboard copies it in with its own
+`refresh_live_data.py`.
 
 ## The files
 

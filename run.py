@@ -42,9 +42,12 @@ TABLE = DATA / 'features.csv'
 REPORT = DATA / 'model-report.json'
 LOG = DATA / 'runs.log'
 
-#: Where the dashboard of project 03 reads the scored rows. Only
-#: `watch` writes it, so the file always says which model produced it.
-SCORED = HERE.parent / '03-payables-panel' / 'data' / 'anomalies.csv'
+#: The scored rows, written here and nowhere else. Only `watch` writes
+#: it, so the file always says which model produced it. Project 03's
+#: `refresh_live_data.py` copies it into that project's `data-live/`.
+#: It used to be written straight into project 03's sample folder, which
+#: the dashboard does not read, so a fresh run never reached the page.
+SCORED = DATA / 'anomalies.csv'
 
 #: Where `score` writes its one-model pass, kept inside this project.
 SCORE_FILE = DATA / 'scored.csv'
